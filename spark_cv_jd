@@ -1,0 +1,112 @@
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, Word2Vec
+from pyspark.ml.linalg import Vectors
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import col
+import pandas as pd
+import numpy as np
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+
+# Tạo Spark session
+spark = SparkSession.builder.appName("FINAL CV-JD-Matching").getOrCreate()
+
+# Đọc dữ liệu CV và JD với dấu phân cách |
+cv_data = spark.read.option("delimiter", "|").csv("/content/sample_data/CVs.txt", header=True, inferSchema=True)
+jd_data = spark.read.option("delimiter", "|").csv("/content/sample_data/JD.txt", header=True, inferSchema=True)
+
+# Kiểm tra dữ liệu đầu vào
+cv_data.show(truncate=False)
+jd_data.show(truncate=False)
+
+# Tiền xử lý dữ liệu: Tokenization và loại bỏ stop words
+tokenizer_CV = Tokenizer(inputCol="CV_Experience", outputCol="words")
+tokenizer_JD = Tokenizer(inputCol="JD_Description", outputCol="words")
+remover = StopWordsRemover(inputCol="words", outputCol="filtered_words")
+
+# Sử dụng Word2Vec thay vì HashingTF và IDF
+word2Vec_CV = Word2Vec(vectorSize=100, minCount=0, inputCol="filtered_words", outputCol="cv_features")
+word2Vec_JD = Word2Vec(vectorSize=100, minCount=0, inputCol="filtered_words", outputCol="jd_features")
+
+# Pipeline để xử lý CVs
+cv_pipeline = Pipeline(stages=[tokenizer_CV, remover, word2Vec_CV])
+cv_model = cv_pipeline.fit(cv_data)
+cv_result = cv_model.transform(cv_data)
+
+# Tiền xử lý JD tương tự
+jd_pipeline = Pipeline(stages=[tokenizer_JD, remover, word2Vec_JD])
+jd_model = jd_pipeline.fit(jd_data)
+jd_result = jd_model.transform(jd_data)
+
+# Lấy các features từ JD và CV
+cv_features = cv_result.select("CV_ID", "cv_features")
+jd_features = jd_result.select("JD_ID", "jd_features")
+
+# Hàm tính cosine similarity
+def cosine_similarity(vec1, vec2):
+    norm_vec1 = Vectors.norm(vec1, 2)
+    norm_vec2 = Vectors.norm(vec2, 2)
+
+    # Kiểm tra nếu một trong các vector có độ dài = 0
+    if norm_vec1 == 0 or norm_vec2 == 0:
+        return float(0)
+
+    return float(vec1.dot(vec2) / (norm_vec1 * norm_vec2))
+
+# Đăng ký hàm tính cosine similarity như một UDF
+from pyspark.sql.functions import udf
+from pyspark.sql.types import FloatType
+
+cosine_udf = udf(cosine_similarity, FloatType())
+
+# Tính toán similarity
+result_df = cv_features.crossJoin(jd_features) \
+    .withColumn("similarity", cosine_udf(col("cv_features"), col("jd_features"))) \
+    .select("CV_ID", "JD_ID", "similarity")
+
+# Xác định mức độ phù hợp (đạt/không đạt) với ngưỡng similarity > 0.4 là đạt
+result_df = result_df.withColumn("match_status", F.when(col("similarity") > 0.4, "Đạt").otherwise("Không đạt"))
+
+# Tính tổng số "Đạt" và "Không đạt"
+count_stats = result_df.groupBy("match_status").count()
+
+# Lấy tổng số lượng "Đạt" và "Không Đạt"
+total_daat = count_stats.filter(count_stats["match_status"] == "Đạt").collect()
+total_khong_daat = count_stats.filter(count_stats["match_status"] == "Không đạt").collect()
+
+# Nếu không có "Đạt" hoặc "Không đạt", gán mặc định là 0
+total_daat_count = total_daat[0]["count"] if total_daat else 0
+total_khong_daat_count = total_khong_daat[0]["count"] if total_khong_daat else 0
+
+# Tạo hai dòng thống kê
+summary_row = [
+    ("", "", "", "Đạt: " + str(total_daat_count)),
+    ("", "", "", "Không Đạt: " + str(total_khong_daat_count))
+]
+
+# Chỉ định schema cho DataFrame summary_df
+schema = StructType([
+    StructField("CV_ID", StringType(), True),
+    StructField("JD_ID", StringType(), True),
+    StructField("similarity", StringType(), True),  # Để giữ nguyên định dạng cột
+    StructField("match_status", StringType(), True)
+])
+
+# Tạo DataFrame với schema đã chỉ định cho dòng thống kê
+summary_df = spark.createDataFrame(summary_row, schema)
+
+# Cập nhật lại summary_df để chỉ có 4 cột giống như result_df
+summary_df = summary_df.select("CV_ID", "JD_ID", "similarity", "match_status")
+
+# Thêm dòng thống kê vào cuối bảng kết quả
+final_result_df = result_df.union(summary_df)
+
+# Hiển thị kết quả (bao gồm cả dòng thống kê)
+print(final_result_df.show(5,truncate=False))  # Hiển thị 100 dòng đầu tiên mà không bị cắt
+
+
+
+# Hiển thị kết quả
+print(final_result_df.toPandas())
+# Lưu kết quả ra file CSV
+final_result_df.toPandas().to_csv("cv_jd_matching_results_with_summary.csv", index=False)

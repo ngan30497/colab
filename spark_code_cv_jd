@@ -1,112 +1,101 @@
-from pyspark.sql import SparkSession
-from pyspark.ml.feature import Tokenizer, StopWordsRemover, Word2Vec
-from pyspark.ml.linalg import Vectors
-from pyspark.ml import Pipeline
-from pyspark.sql.functions import col
-import pandas as pd
-import numpy as np
-from pyspark.sql import functions as F
-from pyspark.sql.types import StructType, StructField, StringType, LongType
-
-# Tạo Spark session
-spark = SparkSession.builder.appName("FINAL CV-JD-Matching").getOrCreate()
-
-# Đọc dữ liệu CV và JD với dấu phân cách |
-cv_data = spark.read.option("delimiter", "|").csv("/content/sample_data/CVs.txt", header=True, inferSchema=True)
-jd_data = spark.read.option("delimiter", "|").csv("/content/sample_data/JD.txt", header=True, inferSchema=True)
-
-# Kiểm tra dữ liệu đầu vào
-cv_data.show(truncate=False)
-jd_data.show(truncate=False)
-
-# Tiền xử lý dữ liệu: Tokenization và loại bỏ stop words
-tokenizer_CV = Tokenizer(inputCol="CV_Experience", outputCol="words")
-tokenizer_JD = Tokenizer(inputCol="JD_Description", outputCol="words")
-remover = StopWordsRemover(inputCol="words", outputCol="filtered_words")
-
-# Sử dụng Word2Vec thay vì HashingTF và IDF
-word2Vec_CV = Word2Vec(vectorSize=100, minCount=0, inputCol="filtered_words", outputCol="cv_features")
-word2Vec_JD = Word2Vec(vectorSize=100, minCount=0, inputCol="filtered_words", outputCol="jd_features")
-
-# Pipeline để xử lý CVs
-cv_pipeline = Pipeline(stages=[tokenizer_CV, remover, word2Vec_CV])
-cv_model = cv_pipeline.fit(cv_data)
-cv_result = cv_model.transform(cv_data)
-
-# Tiền xử lý JD tương tự
-jd_pipeline = Pipeline(stages=[tokenizer_JD, remover, word2Vec_JD])
-jd_model = jd_pipeline.fit(jd_data)
-jd_result = jd_model.transform(jd_data)
-
-# Lấy các features từ JD và CV
-cv_features = cv_result.select("CV_ID", "cv_features")
-jd_features = jd_result.select("JD_ID", "jd_features")
-
-# Hàm tính cosine similarity
-def cosine_similarity(vec1, vec2):
-    norm_vec1 = Vectors.norm(vec1, 2)
-    norm_vec2 = Vectors.norm(vec2, 2)
-
-    # Kiểm tra nếu một trong các vector có độ dài = 0
-    if norm_vec1 == 0 or norm_vec2 == 0:
-        return float(0)
-
-    return float(vec1.dot(vec2) / (norm_vec1 * norm_vec2))
-
-# Đăng ký hàm tính cosine similarity như một UDF
-from pyspark.sql.functions import udf
-from pyspark.sql.types import FloatType
-
-cosine_udf = udf(cosine_similarity, FloatType())
-
-# Tính toán similarity
-result_df = cv_features.crossJoin(jd_features) \
-    .withColumn("similarity", cosine_udf(col("cv_features"), col("jd_features"))) \
-    .select("CV_ID", "JD_ID", "similarity")
-
-# Xác định mức độ phù hợp (đạt/không đạt) với ngưỡng similarity > 0.4 là đạt
-result_df = result_df.withColumn("match_status", F.when(col("similarity") > 0.4, "Đạt").otherwise("Không đạt"))
-
-# Tính tổng số "Đạt" và "Không đạt"
-count_stats = result_df.groupBy("match_status").count()
-
-# Lấy tổng số lượng "Đạt" và "Không Đạt"
-total_daat = count_stats.filter(count_stats["match_status"] == "Đạt").collect()
-total_khong_daat = count_stats.filter(count_stats["match_status"] == "Không đạt").collect()
-
-# Nếu không có "Đạt" hoặc "Không đạt", gán mặc định là 0
-total_daat_count = total_daat[0]["count"] if total_daat else 0
-total_khong_daat_count = total_khong_daat[0]["count"] if total_khong_daat else 0
-
-# Tạo hai dòng thống kê
-summary_row = [
-    ("", "", "", "Đạt: " + str(total_daat_count)),
-    ("", "", "", "Không Đạt: " + str(total_khong_daat_count))
-]
-
-# Chỉ định schema cho DataFrame summary_df
-schema = StructType([
-    StructField("CV_ID", StringType(), True),
-    StructField("JD_ID", StringType(), True),
-    StructField("similarity", StringType(), True),  # Để giữ nguyên định dạng cột
-    StructField("match_status", StringType(), True)
-])
-
-# Tạo DataFrame với schema đã chỉ định cho dòng thống kê
-summary_df = spark.createDataFrame(summary_row, schema)
-
-# Cập nhật lại summary_df để chỉ có 4 cột giống như result_df
-summary_df = summary_df.select("CV_ID", "JD_ID", "similarity", "match_status")
-
-# Thêm dòng thống kê vào cuối bảng kết quả
-final_result_df = result_df.union(summary_df)
-
-# Hiển thị kết quả (bao gồm cả dòng thống kê)
-print(final_result_df.show(5,truncate=False))  # Hiển thị 100 dòng đầu tiên mà không bị cắt
-
-
-
-# Hiển thị kết quả
-print(final_result_df.toPandas())
-# Lưu kết quả ra file CSV
-final_result_df.toPandas().to_csv("cv_jd_matching_results_with_summary.csv", index=False)
+CV_ID|Name|Phone|Birthdate|CV_Experience
+1|Duong Anh Quan|0371835937|1970-2-13|Experienced in process improvement, stakeholder management, and reporting.,C++, C#,Data Science Certification,Expertise in front-end and back-end technologies, including Node.js, Vue.js, GraphQL, MongoDB, Docker,English (Fluent)
+2|Tran Hoang Nhan|0961166135|1994-7-21|Skilled in Agile methodologies, SQL, and business intelligence.,C++, Data Analysis,Agile Scrum,English (Intermediate)
+3|Doan Quyen Hieu|0907662938|1976-2-1|Proficient in business requirements gathering and solution design.,Project Management, Project Management,PMP,English (Fluent)
+4|Au Thanh Duyen|0805608068|1990-8-6|Skilled in Agile methodologies, SQL, and business intelligence.,Groovy, CI,Agile Scrum,English (Fluent)
+5|Doan Thi Quan|0890205667|1993-4-11|Proficient in business requirements gathering and solution design.,Project Management, CI,PMP,English (Fluent)
+6|Vu Hoang Duyen|0565603945|1989-4-3|Experienced in process improvement, stakeholder management, and reporting.,Agile, Java,Data Science Certification,English (Intermediate)
+7|Au Viet Duyen|0501930982|1978-5-5|Strong background in data-driven decision making and reporting.,Agile, C++,AWS,English (Fluent)
+8|Hoang Viet Anh|0886921636|1985-9-16|Experience in business analysis, data analysis, and project management.,Agile, C++,CBAP,English (Fluent)
+9|Bui Hoang Toan|0967596277|1971-9-27|Skilled in Agile methodologies, SQL, and business intelligence.,Data Analysis, C++,Data Science Certification,English (Intermediate)
+10|Duong Minh Viet|0540910926|1996-12-28|Experience in business analysis, data analysis, and project management.,Project Management, Groovy,CBAP,English (Fluent)
+11|Phan Bich Dat|0512010519|1973-8-23|Experienced in process improvement, stakeholder management, and reporting.,testing, Business Process Optimization,Data Science Certification,English (Fluent)
+12|Vu Anh Viet|0319355837|1983-2-8|Experienced in process improvement, stakeholder management, and reporting.,Python, C++,Agile Scrum,English (Fluent)
+13|Doan Viet Dat|0575092720|1983-9-10|Proficient in business requirements gathering and solution design.,Python, Java,PMP,English (Fluent)
+14|Bui Quyen Phuong|0793347671|1997-11-13|Experienced in process improvement, stakeholder management, and reporting.,testing, C++,Six Sigma,English (Intermediate)
+15|Nguyen Quyen Hieu|0891403223|1979-6-24|Experience in business analysis, data analysis, and project management.,C++, testing,Six Sigma,English (Intermediate)
+16|Doan Quyen Long|0805129172|1995-4-18|Skilled in Agile methodologies, SQL, and business intelligence.,Python, C#,PMP,English (Intermediate)
+17|Le Lan Vinh|0700929984|1971-9-28|Proficient in business requirements gathering and solution design.,C++, Business Process Optimization,AWS,English (Fluent)
+18|Pham Tuan Thinh|0995497161|1994-3-23|Experienced in process improvement, stakeholder management, and reporting.,Project Management, Python,Agile Scrum,English (Intermediate)
+19|Au Viet Quan|0509052576|1987-9-17|Experience in business analysis, data analysis, and project management.,Data Analysis, Project Management,Agile Scrum,English (Fluent)
+20|Mai Quyen Anh|0384419424|1983-3-6|Skilled in Agile methodologies, SQL, and business intelligence.,testing, Java,CBAP,English (Fluent)
+21|Bui Minh Anh|0984475470|1973-3-13|Experience in business analysis, data analysis, and project management.,Groovy, Agile,Data Science Certification,English (Fluent)
+22|Pham Tuan Dat|0951242530|1999-6-18|Experience in business analysis, data analysis, and project management.,Python, Data Analysis,Data Science Certification,English (Fluent)
+23|Au Quyen Toan|0943978237|1970-9-3|Strong background in data-driven decision making and reporting.,Agile, Data Analysis,Six Sigma,English (Intermediate)
+24|Duong Thanh Phuc|0702220708|1991-1-23|Experience in business analysis, data analysis, and project management.,Project Management, Agile,AWS,English (Intermediate)
+25|Tran Anh Thinh|0544618994|1988-8-8|Experienced in process improvement, stakeholder management, and reporting.,C#, C#,PMP,English (Fluent)
+26|Doan Thi Viet|0839465056|1986-5-5|Strong background in data-driven decision making and reporting.,CI, C++,Agile Scrum,English (Fluent)
+27|Hoang Hoang Phuc|0724383080|1996-6-21|Strong background in data-driven decision making and reporting.,Agile, SQL,AWS,English (Fluent)
+28|Tran Bich Ngoc|0358812149|1984-9-27|Strong background in data-driven decision making and reporting.,Python, SQL,Agile Scrum,English (Intermediate)
+29|Le Minh Dat|0541712599|1991-3-23|Strong background in data-driven decision making and reporting.,Python, C++,CBAP,English (Intermediate)
+30|Tran Anh Quan|0340979813|1994-4-24|Proficient in business requirements gathering and solution design.,Data Analysis, Data Analysis,Six Sigma,English (Intermediate)
+31|Mai Tuan Nghiep|0856783705|1975-11-21|Strong background in data-driven decision making and reporting.,Data Analysis, Project Management,CBAP,English (Intermediate)
+32|Duong Thi Duyen|0797298893|1981-4-11|Skilled in Agile methodologies, SQL, and business intelligence.,Agile, Project Management,Data Science Certification,English (Fluent)
+33|Au Thanh Viet|0843004856|1993-2-22|Proficient in business requirements gathering and solution design.,Python, Business Process Optimization,PMP,English (Intermediate)
+34|Duong Minh Ngoc|0331836858|1975-10-5|Skilled in Agile methodologies, SQL, and business intelligence.,Java, testing,PMP,English (Fluent)
+35|Tran Thanh Hieu|0812949014|1978-12-12|Experienced in process improvement, stakeholder management, and reporting.,Business Process Optimization, Data Analysis,AWS,English (Fluent)
+36|Nguyen Anh Viet|0938978457|1997-5-21|Proficient in business requirements gathering and solution design.,Project Management, Groovy,Six Sigma,English (Intermediate)
+37|Nguyen Thanh Duyen|0866857575|1992-5-26|Experienced in process improvement, stakeholder management, and reporting.,Project Management, Groovy,CBAP,English (Intermediate)
+38|Doan Quyen Long|0867520894|1985-10-4|Experienced in process improvement, stakeholder management, and reporting.,Agile, C++,Data Science Certification,English (Fluent)
+39|Tran Minh Duyen|0998762192|1983-9-9|Strong background in data-driven decision making and reporting.,Groovy, Project Management,AWS,English (Fluent)
+40|Mai Minh Hieu|0368540426|1985-6-29|Proficient in business requirements gathering and solution design.,C#, C++,Data Science Certification,English (Fluent)
+41|Vu Bich Phuong|0514973522|1998-3-19|Experienced in process improvement, stakeholder management, and reporting.,CI, Agile,CBAP,English (Intermediate)
+42|Mai Bich Toan|0900363238|1989-9-13|Strong background in data-driven decision making and reporting.,Java, CI,PMP,English (Fluent)
+43|Au Thanh Phuong|0591806711|1978-2-31|Strong background in data-driven decision making and reporting.,Business Process Optimization, Groovy,Six Sigma,English (Intermediate)
+44|Tran Thanh Nhan|0577336385|1983-2-31|Proficient in business requirements gathering and solution design.,Java, testing,Data Science Certification,English (Intermediate)
+45|Doan Thanh Ngoc|0598446910|1988-5-29|Experienced in process improvement, stakeholder management, and reporting.,C#, C++,AWS,English (Fluent)
+46|Phan Minh Toan|0398601706|1996-6-13|Skilled in Agile methodologies, SQL, and business intelligence.,testing, SQL,Six Sigma,English (Intermediate)
+47|Le Quyen Nghiep|0823326726|1994-6-20|Proficient in business requirements gathering and solution design.,Business Process Optimization, C++,Agile Scrum,English (Intermediate)
+48|Duong Tuan Hieu|0592030992|1989-7-25|Experienced in process improvement, stakeholder management, and reporting.,testing, CI,Agile Scrum,English (Fluent)
+49|Nguyen Anh Toan|0962529278|1974-10-7|Experience in business analysis, data analysis, and project management.,Data Analysis, Groovy,Agile Scrum,English (Fluent)
+50|Le Thi Thinh|0961904090|1980-8-11|Proficient in business requirements gathering and solution design.,SQL, testing,Agile Scrum,English (Fluent)
+51|Mai Quyen Anh|0924093528|1982-12-31|Experience in business analysis, data analysis, and project management.,testing, Python,Six Sigma,English (Intermediate)
+52|Hoang Thi Phuong|0537418297|1973-10-16|Proficient in business requirements gathering and solution design.,SQL, Business Process Optimization,Six Sigma,English (Intermediate)
+53|Mai Tuan Phuong|0980908331|1977-2-21|Skilled in Agile methodologies, SQL, and business intelligence.,Agile, Java,Agile Scrum,English (Fluent)
+54|Doan Viet Hieu|0738784514|1990-5-27|Experienced in process improvement, stakeholder management, and reporting.,C++, SQL,Data Science Certification,English (Intermediate)
+55|Nguyen Lan Dat|0897512873|1987-9-22|Skilled in Agile methodologies, SQL, and business intelligence.,Business Process Optimization, CI,Agile Scrum,English (Fluent)
+56|Doan Hoang Anh|0892432760|1996-7-29|Experience in business analysis, data analysis, and project management.,SQL, Data Analysis,CBAP,English (Fluent)
+57|Phan Anh Ngan|0886318075|1980-4-4|Skilled in Agile methodologies, SQL, and business intelligence.,Groovy, Project Management,PMP,English (Intermediate)
+58|Au Hoang Toan|0849067128|1970-6-1|Experienced in process improvement, stakeholder management, and reporting.,Python, SQL,Six Sigma,English (Intermediate)
+59|Phan Hoang Long|0392526944|1990-7-10|Skilled in Agile methodologies, SQL, and business intelligence.,Groovy, Groovy,Agile Scrum,English (Fluent)
+60|Phan Tuan Ngan|0718743835|1988-7-19|Experienced in process improvement, stakeholder management, and reporting.,C#, Business Process Optimization,AWS,English (Fluent)
+61|Duong Bich Thinh|0551103993|1993-10-22|Skilled in Agile methodologies, SQL, and business intelligence.,testing, SQL,CBAP,English (Fluent)
+62|Hoang Quyen Phuong|0895681196|1998-7-31|Experience in business analysis, data analysis, and project management.,SQL, Project Management,Six Sigma,English (Fluent)
+63|Nguyen Quyen Toan|0326600834|1998-8-2|Proficient in business requirements gathering and solution design.,Python, C++,CBAP,English (Fluent)
+64|Pham Thanh Long|0937039819|1987-7-29|Proficient in business requirements gathering and solution design.,Data Analysis, Python,AWS,English (Intermediate)
+65|Mai Thi Hieu|0987949490|1992-7-12|Strong background in data-driven decision making and reporting.,Data Analysis, Business Process Optimization,AWS,English (Fluent)
+66|Nguyen Hoang Long|0317006554|1976-10-29|Proficient in business requirements gathering and solution design.,SQL, testing,Agile Scrum,English (Intermediate)
+67|Duong Thanh Dat|0867263404|1995-3-14|Strong background in data-driven decision making and reporting.,Business Process Optimization, Business Process Optimization,Data Science Certification,English (Fluent)
+68|Duong Thi Duyen|0308896388|1977-10-24|Skilled in Agile methodologies, SQL, and business intelligence.,Python, Python,AWS,English (Fluent)
+69|Doan Tuan Ngan|0882878230|1980-12-1|Experience in business analysis, data analysis, and project management.,Project Management, Java,CBAP,English (Fluent)
+70|Duong Lan Anh|0807733266|1978-6-10|Experienced in process improvement, stakeholder management, and reporting.,Agile, Business Process Optimization,AWS,English (Fluent)
+71|Le Lan Vinh|0387419124|1971-12-3|Experienced in process improvement, stakeholder management, and reporting.,C#, C#,Agile Scrum,English (Fluent)
+72|Pham Lan Hieu|0891963922|1982-11-2|Strong background in data-driven decision making and reporting.,Groovy, Data Analysis,PMP,English (Intermediate)
+73|Phan Lan Long|0992505511|1984-12-26|Proficient in business requirements gathering and solution design.,Python, Project Management,CBAP,English (Fluent)
+74|Hoang Thi Hieu|0898283353|1975-10-25|Experience in business analysis, data analysis, and project management.,testing, C#,CBAP,English (Fluent)
+75|Au Thi Thinh|0872276251|1977-12-8|Experienced in process improvement, stakeholder management, and reporting.,Project Management, Business Process Optimization,CBAP,English (Fluent)
+76|Phan Lan Nghiep|0356400810|1988-9-7|Experience in business analysis, data analysis, and project management.,C++, Business Process Optimization,Data Science Certification,English (Fluent)
+77|Bui Minh Anh|0312161831|1997-7-12|Proficient in business requirements gathering and solution design.,Python, SQL,AWS,English (Intermediate)
+78|Vu Anh Anh|0858903692|1983-3-23|Proficient in business requirements gathering and solution design.,Business Process Optimization, Python,AWS,English (Intermediate)
+79|Vu Thanh Ngoc|0331518295|1992-11-15|Experience in business analysis, data analysis, and project management.,Data Analysis, Groovy,Six Sigma,English (Intermediate)
+80|Nguyen Anh Duyen|0806705827|1982-5-18|Strong background in data-driven decision making and reporting.,Python, Java,AWS,English (Fluent)
+81|Hoang Viet Quan|0773831299|1995-11-6|Experienced in process improvement, stakeholder management, and reporting.,CI, Business Process Optimization,Agile Scrum,English (Fluent)
+82|Le Viet Dat|0843532924|1997-7-1|Experienced in process improvement, stakeholder management, and reporting.,Project Management, Python,Agile Scrum,English (Intermediate)
+83|Le Hoang Ngoc|0898893295|1991-2-22|Experience in business analysis, data analysis, and project management.,CI, CI,Agile Scrum,English (Fluent)
+84|Au Quyen Nghiep|0309673517|1985-7-15|Strong background in data-driven decision making and reporting.,C++, Groovy,Six Sigma,English (Fluent)
+85|Au Minh Dat|0870419160|1989-5-2|Skilled in Agile methodologies, SQL, and business intelligence.,C#, SQL,Agile Scrum,English (Fluent)
+86|Phan Tuan Quan|0791467848|1988-7-26|Experienced in process improvement, stakeholder management, and reporting.,Python, C++,CBAP,English (Fluent)
+87|Duong Thanh Long|0833198179|1990-9-29|Strong background in data-driven decision making and reporting.,Groovy, testing,Agile Scrum,English (Fluent)
+88|Phan Thanh Thinh|0833471262|1993-1-13|Proficient in business requirements gathering and solution design.,SQL, Groovy,Data Science Certification,English (Intermediate)
+89|Tran Bich Nhan|0927339485|1982-10-7|Experience in business analysis, data analysis, and project management.,Java, Java,Agile Scrum,English (Fluent)
+90|Tran Lan Long|0305066276|1984-9-21|Proficient in business requirements gathering and solution design.,Python, Data Analysis,PMP,English (Intermediate)
+91|Phan Thanh Duyen|0918475054|1998-6-19|Skilled in Agile methodologies, SQL, and business intelligence.,Java, C#,AWS,English (Fluent)
+92|Vu Minh Nhan|0878394663|1986-10-23|Experience in business analysis, data analysis, and project management.,Project Management, SQL,Six Sigma,English (Fluent)
+93|Doan Viet Thinh|0353800566|1970-5-18|Strong background in data-driven decision making and reporting.,C++, Agile,AWS,English (Fluent)
+94|Phan Thanh Anh|0882867677|1995-11-28|Proficient in business requirements gathering and solution design.,Python, Agile,Agile Scrum,English (Intermediate)
+95|Au Bich Thinh|0713315815|1986-5-4|Strong background in data-driven decision making and reporting.,Python, Python,Data Science Certification,English (Fluent)
+96|Pham Viet Phuc|0905793370|1983-2-25|Experienced in process improvement, stakeholder management, and reporting.,Python, C++,Agile Scrum,English (Intermediate)
+97|Le Bich Thinh|0820671683|1981-10-21|Strong background in data-driven decision making and reporting.,Project Management, SQL,Six Sigma,English (Intermediate)
+98|Le Hoang Anh|0993772517|1992-7-6|Proficient in business requirements gathering and solution design.,C#, Project Management,PMP,English (Intermediate)
+99|Phan Tuan Ngoc|0910438050|1971-7-16|Skilled in Agile methodologies, SQL, and business intelligence.,Java, Agile,Agile Scrum,English (Intermediate)
+100|Nguyen Quyen Thinh|0832130855|1985-10-22|Skilled in Agile methodologies, SQL, and business intelligence.,SQL, Project Management,Six Sigma,English (Fluent)
